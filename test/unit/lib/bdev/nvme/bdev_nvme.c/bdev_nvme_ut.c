@@ -2375,7 +2375,7 @@ static void
 ut_test_submit_fused_nvme_cmd(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	struct nvme_bdev_channel *nbdev_ch = spdk_io_channel_get_ctx(ch);
-	struct nvme_bdev_io *bio = (struct nvme_bdev_io *)bdev_io->driver_ctx;
+	struct nvme_bdev_io *bio = (struct nvme_bdev_io *)spdk_bdev_io_to_ctx(bdev_io);
 	struct ut_nvme_req *req;
 	struct nvme_io_path *io_path;
 	struct spdk_nvme_qpair *qpair;
@@ -4843,7 +4843,7 @@ test_retry_io_for_io_path_error(void)
 	bdev_io = ut_alloc_bdev_io(SPDK_BDEV_IO_TYPE_WRITE, nbdev, NULL);
 	ut_bdev_io_set_buf(bdev_io);
 
-	bio = (struct nvme_bdev_io *)bdev_io->driver_ctx;
+	bio = (struct nvme_bdev_io *)spdk_bdev_io_to_ctx(bdev_io);
 
 	ch = spdk_get_io_channel(nbdev);
 	SPDK_CU_ASSERT_FATAL(ch != NULL);
@@ -5046,7 +5046,7 @@ test_retry_io_count(void)
 	bdev_io = ut_alloc_bdev_io(SPDK_BDEV_IO_TYPE_WRITE, nbdev, NULL);
 	ut_bdev_io_set_buf(bdev_io);
 
-	bio = (struct nvme_bdev_io *)bdev_io->driver_ctx;
+	bio = (struct nvme_bdev_io *)spdk_bdev_io_to_ctx(bdev_io);
 
 	ch = spdk_get_io_channel(nbdev);
 	SPDK_CU_ASSERT_FATAL(ch != NULL);
@@ -5361,7 +5361,7 @@ test_retry_io_for_ana_error(void)
 	bdev_io = ut_alloc_bdev_io(SPDK_BDEV_IO_TYPE_WRITE, nbdev, NULL);
 	ut_bdev_io_set_buf(bdev_io);
 
-	bio = (struct nvme_bdev_io *)bdev_io->driver_ctx;
+	bio = (struct nvme_bdev_io *)spdk_bdev_io_to_ctx(bdev_io);
 
 	ch = spdk_get_io_channel(nbdev);
 	SPDK_CU_ASSERT_FATAL(ch != NULL);
@@ -5592,7 +5592,7 @@ test_retry_io_if_ctrlr_is_resetting(void)
 	CU_ASSERT(bdev_io2->internal.f.in_submit_request == true);
 	CU_ASSERT(bdev_io1 == spdk_bdev_io_from_ctx(TAILQ_FIRST(&nbdev_ch->retry_io_list)));
 	CU_ASSERT(bdev_io2 == spdk_bdev_io_from_ctx(
-			  TAILQ_NEXT((struct nvme_bdev_io *)bdev_io1->driver_ctx,
+			  TAILQ_NEXT((struct nvme_bdev_io *)spdk_bdev_io_to_ctx(bdev_io1),
 				     retry_link)));
 
 	poll_threads();
@@ -6882,7 +6882,7 @@ test_retry_io_to_same_path(void)
 	bdev_io = ut_alloc_bdev_io(SPDK_BDEV_IO_TYPE_WRITE, nbdev, ch);
 	ut_bdev_io_set_buf(bdev_io);
 
-	bio = (struct nvme_bdev_io *)bdev_io->driver_ctx;
+	bio = (struct nvme_bdev_io *)spdk_bdev_io_to_ctx(bdev_io);
 
 	io_path1 = ut_get_io_path_by_ctrlr(nbdev_ch, nvme_ctrlr1);
 	SPDK_CU_ASSERT_FATAL(io_path1 != NULL);
