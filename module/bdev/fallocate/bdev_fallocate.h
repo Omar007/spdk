@@ -11,13 +11,26 @@
 
 #include "spdk/bdev_module.h"
 
+#define FALLOCATE_MAX_XATTRS 255
+
 typedef void (*spdk_bdev_fallocate_delete_complete)(void *cb_arg, int bdeverrno);
+
+struct bdev_fallocate_xattr {
+	char *name;
+	char *value;
+};
+
+struct bdev_fallocate_xattrs {
+	size_t num_xattrs;
+	struct bdev_fallocate_xattr xattrs[FALLOCATE_MAX_XATTRS];
+};
 
 struct bdev_fallocate_create_opts {
 	char *name;
 	struct spdk_uuid uuid;
 	char *filename;
 	uint64_t size;
+	struct bdev_fallocate_xattrs xattrs;
 };
 
 struct bdev_fallocate_delete_opts {
