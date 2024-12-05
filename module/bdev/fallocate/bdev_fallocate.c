@@ -154,6 +154,7 @@ bdev_fallocate_create(const struct bdev_fallocate_create_opts *opts, struct spdk
 	struct bdev_fallocate *fallocate;
 	struct stat statBuf;
 	int rc = -1;
+	size_t i;
 
 	fallocate = calloc(1, sizeof(*fallocate));
 	if (!fallocate) {
@@ -209,7 +210,18 @@ bdev_fallocate_create(const struct bdev_fallocate_create_opts *opts, struct spdk
 		goto error;
 	}
 
-	SPDK_DEBUGLOG("allocating file %s of %ju bytes\n", fallocate->filename, opts->size);
+	SPDK_DEBUGLOG("setting xattrs (file=%s,fd=%d)\n", fallocate->filename, fallocate->fd);
+
+	for (i = 0; i < opts->xattrs.num_xattrs; i++) {
+		if (fsetxattr(fallocate->fd, opts->xattrs.xattrs[i].name, opts->xattrs.xattrs[i].value, strlen(opts->xattrs.xattrs[i].value), 0) != 0) {
+			SPDK_ERRLOG("setxattr() failed (file=%s,fd=%d,attr=%s), errno %d: %s\n",
+					fallocate->filename, fallocate->fd, opts->xattrs.xattrs[i].name, errno, spdk_strerror(errno));
+			rc = errno;
+			goto error;
+		}
+	}
+
+	SPDK_DEBUGLOG("allocating %ju bytes (file=%s,fd=%s)\n", opts->size, fallocate->filename, fallocate->fd);
 
 	rc = posix_fallocate(fallocate->fd, 0, opts->size);
 	if (rc != 0) {
