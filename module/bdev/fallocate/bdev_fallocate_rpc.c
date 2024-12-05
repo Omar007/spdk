@@ -11,10 +11,40 @@
 #include "bdev_fallocate.h"
 
 static void
+free_rpc_bdev_fallocate_xattrs(struct bdev_fallocate_xattrs *xattrs) {
+	size_t i;
+
+	for (i = 0; i < xattrs->num_xattrs; i++) {
+		free(xattrs->xattrs[i].name);
+		free(xattrs->xattrs[i].value);
+	}
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_fallocate_xattr_decoders[] = {
+	{"name", offsetof(struct bdev_fallocate_xattr, name), spdk_json_decode_string},
+	{"value", offsetof(struct bdev_fallocate_xattr, value), spdk_json_decode_string},
+};
+
+static int
+decode_fallocate_xattr(const struct spdk_json_val *val, void *out) {
+	return spdk_json_decode_object(val, rpc_bdev_fallocate_xattr_decoders,
+			SPDK_COUNTOF(rpc_bdev_fallocate_xattr_decoders), out);
+}
+
+static int
+decode_fallocate_xattrs(const struct spdk_json_val *val, void *out) {
+	struct bdev_fallocate_xattrs *xattrs = out;
+
+	return spdk_json_decode_array(val, decode_fallocate_xattr, xattrs->xattrs,
+			FALLOCATE_MAX_XATTRS, &xattrs->num_xattrs, sizeof(struct bdev_fallocate_xattr));
+}
+
+static void
 free_rpc_bdev_fallocate_create_opts(struct bdev_fallocate_create_opts *opts)
 {
 	free(opts->name);
 	free(opts->filename);
+	free_rpc_bdev_fallocate_xattrs(&opts->xattrs);
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_fallocate_create_decoders[] = {
@@ -22,6 +52,7 @@ static const struct spdk_json_object_decoder rpc_bdev_fallocate_create_decoders[
 	{"uuid", offsetof(struct bdev_fallocate_create_opts, uuid), spdk_json_decode_uuid, true},
 	{"filename", offsetof(struct bdev_fallocate_create_opts, filename), spdk_json_decode_string},
 	{"size", offsetof(struct bdev_fallocate_create_opts, size), spdk_json_decode_uint64},
+	{"xattrs", offsetof(struct bdev_fallocate_create_opts, xattrs), decode_fallocate_xattrs,true},
 };
 
 static void
