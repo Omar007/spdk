@@ -78,7 +78,7 @@ rpc_bdev_fallocate_create(struct spdk_jsonrpc_request *request, const struct spd
 	}
 
 	w = spdk_jsonrpc_begin_result(request);
-	spdk_json_write_string(w, opts.name);
+	spdk_json_write_string(w, bdev->name);
 	spdk_jsonrpc_end_result(request, w);
 
 cleanup:
@@ -168,3 +168,43 @@ cleanup:
 	free_rpc_bdev_fallocate_resize_opts(&opts);
 }
 SPDK_RPC_REGISTER("bdev_fallocate_resize", rpc_bdev_fallocate_resize, SPDK_RPC_RUNTIME)
+
+
+
+static void
+free_rpc_bdev_fallocate_set_xattrs_opts(struct bdev_fallocate_set_xattrs_opts *opts)
+{
+	free(opts->name);
+	free_rpc_bdev_fallocate_xattrs(&opts->xattrs);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_fallocate_set_xattrs_opts_decoders[] = {
+	{"name", offsetof(struct bdev_fallocate_set_xattrs_opts, name), spdk_json_decode_string},
+	{"xattrs", offsetof(struct bdev_fallocate_set_xattrs_opts, xattrs), decode_fallocate_xattrs},
+};
+
+static void
+rpc_bdev_fallocate_set_xattrs(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+{
+	struct bdev_fallocate_set_xattrs_opts opts = {};
+	int rc = 0;
+
+	if (spdk_json_decode_object(params, rpc_bdev_fallocate_set_xattrs_opts_decoders,
+			SPDK_COUNTOF(rpc_bdev_fallocate_set_xattrs_opts_decoders), &opts)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+				"spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	rc = bdev_fallocate_set_xattrs(&opts);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free_rpc_bdev_fallocate_set_xattrs_opts(&opts);
+}
+SPDK_RPC_REGISTER("bdev_fallocate_set_xattrs", rpc_bdev_fallocate_set_xattrs, SPDK_RPC_RUNTIME)
