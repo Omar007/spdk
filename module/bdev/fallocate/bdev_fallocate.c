@@ -68,7 +68,7 @@ static int
 bdev_fallocate_destruct(void *ctx)
 {
 	struct bdev_fallocate *fallocate = ctx;
-	int rc = 0;
+	int rc;
 
 	TAILQ_REMOVE(&g_fallocate_bdev_head, fallocate, link);
 
@@ -143,6 +143,43 @@ static const struct spdk_bdev_fn_table fallocate_bdev_fn_table = {
 
 
 
+static int
+bdev_fallocate_do_fallocate(struct bdev_fallocate *fallocate, uint64_t size) {
+	uint64_t fallocate_size;
+	int rc;
+
+	fallocate_size = spdk_fd_get_size(fallocate->fd);
+	if (size <= fallocate_size) {
+		return 0;
+	}
+
+	SPDK_DEBUGLOG("allocating space (file=%s,fd=%d): old size %ju, new size %ju\n",
+			fallocate->filename, fallocate->fd, fallocate_size, size);
+
+	rc = posix_fallocate(fallocate->fd, 0, size);
+	if (rc != 0) {
+		SPDK_ERRLOG("posix_fallocate() failed (file=%s,fd=%d), errno %d: %s\n",
+				fallocate->filename, fallocate->fd, rc, spdk_strerror(rc));
+	}
+	return rc;
+}
+
+static int
+bdev_fallocate_do_setxattrs(struct bdev_fallocate *fallocate, const struct bdev_fallocate_xattrs *xattrs) {
+	size_t i;
+
+	SPDK_DEBUGLOG("setting xattrs (file=%s,fd=%d)\n", fallocate->filename, fallocate->fd);
+
+	for (i = 0; i < xattrs->num_xattrs; i++) {
+		if (fsetxattr(fallocate->fd, xattrs->xattrs[i].name, xattrs->xattrs[i].value, strlen(xattrs->xattrs[i].value), 0) != 0) {
+			SPDK_ERRLOG("setxattr() failed (file=%s,fd=%d,attr=%s), errno %d: %s\n",
+					fallocate->filename, fallocate->fd, xattrs->xattrs[i].name, errno, spdk_strerror(errno));
+			return errno;
+		}
+	}
+	return 0;
+}
+
 static void
 dummy_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx)
 {
@@ -154,7 +191,6 @@ bdev_fallocate_create(const struct bdev_fallocate_create_opts *opts, struct spdk
 	struct bdev_fallocate *fallocate;
 	struct stat statBuf;
 	int rc = -1;
-	size_t i;
 
 	fallocate = calloc(1, sizeof(*fallocate));
 	if (!fallocate) {
@@ -192,7 +228,6 @@ bdev_fallocate_create(const struct bdev_fallocate_create_opts *opts, struct spdk
 		if (!S_ISREG(statBuf.st_mode)) {
 			SPDK_ERRLOG("not S_ISREG() (file=%s), mode %d\n",
 					fallocate->filename, statBuf.st_mode);
-			rc = -1;
 			goto error;
 		}
 	} else if (errno != ENOENT) {
@@ -210,35 +245,31 @@ bdev_fallocate_create(const struct bdev_fallocate_create_opts *opts, struct spdk
 		goto error;
 	}
 
-	SPDK_DEBUGLOG("setting xattrs (file=%s,fd=%d)\n", fallocate->filename, fallocate->fd);
-
-	for (i = 0; i < opts->xattrs.num_xattrs; i++) {
-		if (fsetxattr(fallocate->fd, opts->xattrs.xattrs[i].name, opts->xattrs.xattrs[i].value, strlen(opts->xattrs.xattrs[i].value), 0) != 0) {
-			SPDK_ERRLOG("setxattr() failed (file=%s,fd=%d,attr=%s), errno %d: %s\n",
-					fallocate->filename, fallocate->fd, opts->xattrs.xattrs[i].name, errno, spdk_strerror(errno));
-			rc = errno;
-			goto error;
-		}
-	}
-
-	SPDK_DEBUGLOG("allocating %ju bytes (file=%s,fd=%s)\n", opts->size, fallocate->filename, fallocate->fd);
-
-	rc = posix_fallocate(fallocate->fd, 0, opts->size);
-	if (rc != 0) {
-		SPDK_ERRLOG("posix_fallocate() failed (file=%s,fd=%d), errno %d: %s\n",
-				fallocate->filename, fallocate->fd, rc, spdk_strerror(rc));
-		goto error;
-	}
-
+	// Do this a bit earlier instead of at the last moment.
+	// This prevents a conflicting create call from affecting the underlying file
+	// of the one that already existed.
 	spdk_io_device_register(fallocate, NULL, NULL, 0, fallocate->bdev.name);
 	rc = spdk_bdev_register(&fallocate->bdev);
 	if (rc != 0) {
-		spdk_io_device_unregister(fallocate, NULL);
-		goto error;
+		goto modify_error;
+	}
+
+	rc = bdev_fallocate_do_setxattrs(fallocate, &opts->xattrs);
+	if (rc != 0) {
+		goto modify_error;
+	}
+
+	rc = bdev_fallocate_do_fallocate(fallocate, opts->size);
+	if (rc != 0) {
+		goto modify_error;
 	}
 
 	TAILQ_INSERT_TAIL(&g_fallocate_bdev_head, fallocate, link);
+	*bdev = &fallocate->bdev;
 	return 0;
+
+modify_error:
+	spdk_io_device_unregister(fallocate, NULL);
 
 error:
 	bdev_fallocate_close(fallocate);
@@ -285,8 +316,7 @@ bdev_fallocate_resize(const struct bdev_fallocate_resize_opts *opts)
 	struct spdk_bdev_desc *desc;
 	struct spdk_bdev *bdev;
 	struct bdev_fallocate *fallocate;
-	uint64_t fallocate_size;
-	int rc = 0;
+	int rc;
 
 	rc = spdk_bdev_open_ext(opts->name, false, dummy_bdev_event_cb, NULL, &desc);
 	if (rc != 0) {
@@ -301,23 +331,40 @@ bdev_fallocate_resize(const struct bdev_fallocate_resize_opts *opts)
 
 	fallocate = SPDK_CONTAINEROF(bdev, struct bdev_fallocate, bdev);
 
-	fallocate_size = spdk_fd_get_size(fallocate->fd);
-	if (opts->size <= fallocate_size) {
-		goto exit;
-	}
-
 	if (opts->size % fallocate->bdev.blocklen != 0) {
 		SPDK_ERRLOG("new size %ju is not a multiple of %d\n", opts->size, fallocate->bdev.blocklen);
 		rc = -1;
 		goto exit;
 	}
 
-	SPDK_DEBUGLOG("resizing file %s: old size %ju, new size %ju\n", fallocate->filename, fallocate_size, opts->size);
+	rc = bdev_fallocate_do_fallocate(fallocate, opts->size);
 
-	rc = posix_fallocate(fallocate->fd, 0, opts->size);
+exit:
+	spdk_bdev_close(desc);
+	return rc;
+}
+
+int
+bdev_fallocate_set_xattrs(const struct bdev_fallocate_set_xattrs_opts *opts) {
+	struct spdk_bdev_desc *desc;
+	struct spdk_bdev *bdev;
+	struct bdev_fallocate *fallocate;
+	int rc;
+
+	rc = spdk_bdev_open_ext(opts->name, false, dummy_bdev_event_cb, NULL, &desc);
 	if (rc != 0) {
-		SPDK_ERRLOG("could not resize file %s, errno: %d.\n", fallocate->filename, rc);
+		return rc;
 	}
+
+	bdev = spdk_bdev_desc_get_bdev(desc);
+	if (bdev->module != &fallocate_if) {
+		rc = -ENODEV;
+		goto exit;
+	}
+
+	fallocate = SPDK_CONTAINEROF(bdev, struct bdev_fallocate, bdev);
+
+	rc = bdev_fallocate_do_setxattrs(fallocate, &opts->xattrs);
 
 exit:
 	spdk_bdev_close(desc);
