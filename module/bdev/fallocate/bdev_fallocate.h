@@ -42,8 +42,14 @@ struct bdev_fallocate_resize_opts {
 	uint64_t size;
 };
 
+struct bdev_fallocate_set_xattrs_opts {
+	char *name;
+	struct bdev_fallocate_xattrs xattrs;
+};
+
 int bdev_fallocate_create(const struct bdev_fallocate_create_opts *opts, struct spdk_bdev **bdev);
 void bdev_fallocate_delete(const struct bdev_fallocate_delete_opts *opts, spdk_bdev_fallocate_delete_complete cb_fn, void *cb_arg);
 int bdev_fallocate_resize(const struct bdev_fallocate_resize_opts *opts);
+int bdev_fallocate_set_xattrs(const struct bdev_fallocate_set_xattrs_opts *opts);
 
 #endif /* SPDK_BDEV_FALLOCATE_H */
