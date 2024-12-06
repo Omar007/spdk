@@ -10,10 +10,13 @@
 #include "spdk/log.h"
 #include "spdk/string.h"
 
+#include "../uring/bdev_uring.h"
+
 #include "bdev_fallocate.h"
 
 struct bdev_fallocate {
 	struct spdk_bdev bdev;
+	struct spdk_bdev *access_bdev;
 	char *filename;
 	int fd;
 	TAILQ_ENTRY(bdev_fallocate) link;
@@ -189,6 +192,7 @@ int
 bdev_fallocate_create(const struct bdev_fallocate_create_opts *opts, struct spdk_bdev **bdev)
 {
 	struct bdev_fallocate *fallocate;
+	struct bdev_uring_opts uring_opts = {};
 	struct stat statBuf;
 	int rc = -1;
 
@@ -215,7 +219,7 @@ bdev_fallocate_create(const struct bdev_fallocate_create_opts *opts, struct spdk
 		goto error;
 	}
 
-	fallocate->bdev.name = strdup(opts->name);
+	fallocate->bdev.name = spdk_sprintf_alloc("%s-base", opts->name);
 	if (!fallocate->bdev.name) {
 		goto error;
 	}
@@ -264,8 +268,17 @@ bdev_fallocate_create(const struct bdev_fallocate_create_opts *opts, struct spdk
 		goto modify_error;
 	}
 
+	uring_opts.block_size = fallocate->bdev.blocklen;
+	uring_opts.filename = fallocate->filename;
+	uring_opts.name = opts->name;
+	fallocate->access_bdev = create_uring_bdev(&uring_opts);
+	if (fallocate->access_bdev == NULL) {
+		rc = -1;
+		goto modify_error;
+	}
+
 	TAILQ_INSERT_TAIL(&g_fallocate_bdev_head, fallocate, link);
-	*bdev = &fallocate->bdev;
+	*bdev = fallocate->access_bdev;
 	return 0;
 
 modify_error:
@@ -277,15 +290,44 @@ error:
 	return rc;
 }
 
+struct access_bdev_delete_ctx {
+	spdk_bdev_fallocate_delete_complete cb_fn;
+	void *cb_arg;
+	struct bdev_fallocate *fallocate;
+};
+
+static void
+access_bdev_deleted_cb(void *arg, int bdeverrno)
+{
+	struct access_bdev_delete_ctx *ctx = arg;
+
+	if (unlink(ctx->fallocate->filename) != 0) {
+		SPDK_ERRLOG("unlink() failed (file=%s), errno %d: %s\n",
+				ctx->fallocate->filename, errno, spdk_strerror(errno));
+	}
+
+	spdk_bdev_unregister(&ctx->fallocate->bdev, ctx->cb_fn, ctx->cb_arg);
+}
+
 void
 bdev_fallocate_delete(const struct bdev_fallocate_delete_opts *opts, spdk_bdev_fallocate_delete_complete cb_fn, void *cb_arg)
 {
 	struct spdk_bdev_desc *desc;
 	struct spdk_bdev *bdev;
 	struct bdev_fallocate *fallocate;
+	char *fallocateName;
+	struct access_bdev_delete_ctx *ctx;
 	int rc;
 
-	rc = spdk_bdev_open_ext(opts->name, false, dummy_bdev_event_cb, NULL, &desc);
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	fallocateName = spdk_sprintf_alloc("%s-base", opts->name);
+	rc = spdk_bdev_open_ext(fallocateName, false, dummy_bdev_event_cb, NULL, &desc);
+	free(fallocateName);
 	if (rc != 0) {
 		cb_fn(cb_arg, rc);
 		return;
@@ -299,12 +341,10 @@ bdev_fallocate_delete(const struct bdev_fallocate_delete_opts *opts, spdk_bdev_f
 
 	fallocate = SPDK_CONTAINEROF(bdev, struct bdev_fallocate, bdev);
 
-	if (unlink(fallocate->filename) != 0) {
-		SPDK_ERRLOG("unlink() failed (file=%s), errno %d: %s\n",
-				fallocate->filename, errno, spdk_strerror(errno));
-	}
-
-	spdk_bdev_unregister(bdev, cb_fn, cb_arg);
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->fallocate = fallocate;
+	delete_uring_bdev(fallocate->access_bdev->name, access_bdev_deleted_cb, ctx);
 
 cleanup:
 	spdk_bdev_close(desc);
@@ -316,9 +356,12 @@ bdev_fallocate_resize(const struct bdev_fallocate_resize_opts *opts)
 	struct spdk_bdev_desc *desc;
 	struct spdk_bdev *bdev;
 	struct bdev_fallocate *fallocate;
+	char *fallocateName;
 	int rc;
 
-	rc = spdk_bdev_open_ext(opts->name, false, dummy_bdev_event_cb, NULL, &desc);
+	fallocateName = spdk_sprintf_alloc("%s-base", opts->name);
+	rc = spdk_bdev_open_ext(fallocateName, false, dummy_bdev_event_cb, NULL, &desc);
+	free(fallocateName);
 	if (rc != 0) {
 		return rc;
 	}
@@ -338,6 +381,10 @@ bdev_fallocate_resize(const struct bdev_fallocate_resize_opts *opts)
 	}
 
 	rc = bdev_fallocate_do_fallocate(fallocate, opts->size);
+	if (rc == 0) {
+		fallocate->bdev.blockcnt = spdk_fd_get_size(fallocate->fd) / fallocate->bdev.blocklen;
+		rc = bdev_uring_rescan(fallocate->access_bdev->name);
+	}
 
 exit:
 	spdk_bdev_close(desc);
