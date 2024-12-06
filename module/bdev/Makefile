@@ -6,7 +6,7 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y += delay error fallocate gpt lvol malloc null nvme passthru raid split zone_block
+DIRS-y += delay error gpt lvol malloc null nvme passthru raid split zone_block
 
 DIRS-$(CONFIG_XNVME) += xnvme
 
@@ -16,7 +16,7 @@ DIRS-$(CONFIG_OCF) += ocf
 
 DIRS-$(CONFIG_VBDEV_COMPRESS) += compress
 
-DIRS-$(CONFIG_URING) += uring
+DIRS-$(CONFIG_URING) += uring fallocate
 
 ifeq ($(OS),Linux)
 DIRS-y += aio ftl
