@@ -16,28 +16,23 @@
 
 struct bdev_fallocate {
 	struct spdk_bdev bdev;
-	struct spdk_bdev *access_bdev;
+	struct spdk_bdev_desc *access_desc;
+	struct spdk_thread *access_thread;
 	char *filename;
 	int fd;
 	TAILQ_ENTRY(bdev_fallocate) link;
 };
 static TAILQ_HEAD(, bdev_fallocate) g_fallocate_bdev_head = TAILQ_HEAD_INITIALIZER(g_fallocate_bdev_head);
 
-static void bdev_fallocate_free(struct bdev_fallocate *fallocate)
-{
-	if (fallocate == NULL) {
-		return;
-	}
-	free(fallocate->filename);
-	free(fallocate->bdev.name);
-	free(fallocate);
-}
+struct bdev_fallocate_io {
+	struct spdk_io_channel *access_channel;
+};
 
 
 
 static int bdev_fallocate_initialize(void) { return 0; }
 static void bdev_fallocate_finish(void) {}
-static int bdev_fallocate_get_ctx_size(void) { return 0; };
+static int bdev_fallocate_get_ctx_size(void) { return 0; }
 
 static struct spdk_bdev_module fallocate_if = {
 	.name			= "fallocate",
@@ -48,6 +43,8 @@ static struct spdk_bdev_module fallocate_if = {
 SPDK_BDEV_MODULE_REGISTER(fallocate, &fallocate_if)
 
 
+
+static void dummy_bdev_delete_cb(void *cb_arg, int bdeverrno) {}
 
 static int
 bdev_fallocate_close(struct bdev_fallocate *fallocate)
@@ -67,26 +64,77 @@ bdev_fallocate_close(struct bdev_fallocate *fallocate)
 	return 0;
 }
 
+static void
+bdev_fallocate_access_desc_close(void *ctx)
+{
+	struct spdk_bdev_desc *desc = ctx;
+	char *access_name = strdup(spdk_bdev_desc_get_bdev(desc)->name);
+
+	spdk_bdev_close(desc);
+	delete_uring_bdev(access_name, dummy_bdev_delete_cb, NULL);
+
+	free(access_name);
+}
+
+static void
+bdev_fallocate_io_unregister_cb(void *io_device)
+{
+	struct bdev_fallocate *fallocate = io_device;
+
+	if (fallocate == NULL) {
+		return;
+	}
+	free(fallocate->filename);
+	free(fallocate->bdev.name);
+	free(fallocate);
+}
+
 static int
 bdev_fallocate_destruct(void *ctx)
 {
 	struct bdev_fallocate *fallocate = ctx;
-	int rc;
+	int rc = 0;
 
 	TAILQ_REMOVE(&g_fallocate_bdev_head, fallocate, link);
 
+	if (fallocate->access_thread && fallocate->access_thread != spdk_get_thread()) {
+		spdk_thread_send_msg(fallocate->access_thread, bdev_fallocate_access_desc_close, fallocate->access_desc);
+	} else {
+		bdev_fallocate_access_desc_close(fallocate->access_desc);
+	}
+
 	rc = bdev_fallocate_close(fallocate);
 
-	spdk_io_device_unregister(fallocate, NULL);
-	bdev_fallocate_free(fallocate);
+	spdk_io_device_unregister(fallocate, bdev_fallocate_io_unregister_cb);
 	return rc;
+}
+
+static void
+bdev_fallocate_complete_io_stack(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	assert(bdev_io == cb_arg);
+	spdk_bdev_io_stack_pop(bdev_io);
+	spdk_bdev_io_complete(bdev_io, success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED);
 }
 
 static void
 bdev_fallocate_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
-	SPDK_DEBUGLOG("submit request hit!\n");
-	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	struct bdev_fallocate *fallocate = SPDK_CONTAINEROF(bdev_io->bdev, struct bdev_fallocate, bdev);
+	struct bdev_fallocate_io *fallocate_io = spdk_io_channel_get_ctx(ch);
+	int rc = 0;
+
+	spdk_bdev_io_stack_push(bdev_io);
+	rc = spdk_bdev_io_submit(bdev_io, fallocate->access_desc, fallocate_io->access_channel,
+			bdev_fallocate_complete_io_stack, bdev_io);
+	if (rc != 0) {
+		/* Currently spdk_bdev_io_submit() always returns 0. This path
+		* does not need to allocate a bdev_io, so -ENOMEM handling
+		* is not required.
+		*/
+		SPDK_ERRLOG("bdev_io submission failed\n");
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+	}
 }
 
 static bool
@@ -94,7 +142,7 @@ bdev_fallocate_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 {
 	struct bdev_fallocate *fallocate = ctx;
 
-	return spdk_bdev_io_type_supported(fallocate->access_bdev, io_type);
+	return spdk_bdev_io_type_supported(spdk_bdev_desc_get_bdev(fallocate->access_desc), io_type);
 }
 
 static struct spdk_io_channel *
@@ -102,7 +150,7 @@ bdev_fallocate_get_io_channel(void *ctx)
 {
 	struct bdev_fallocate *fallocate = ctx;
 
-	return spdk_get_io_channel(fallocate->access_bdev->ctxt);
+	return spdk_get_io_channel(fallocate);
 }
 
 static int
@@ -151,15 +199,14 @@ static const struct spdk_bdev_fn_table fallocate_bdev_fn_table = {
 
 static int
 bdev_fallocate_do_fallocate(struct bdev_fallocate *fallocate, uint64_t size) {
-	uint64_t fallocate_size;
-	int rc;
+	uint64_t fallocate_size = spdk_fd_get_size(fallocate->fd);
+	int rc = 0;
 
-	fallocate_size = spdk_fd_get_size(fallocate->fd);
 	if (size <= fallocate_size) {
-		return 0;
+		goto exit;
 	}
 
-	SPDK_DEBUGLOG("allocating space (file=%s,fd=%d): old size %ju, new size %ju\n",
+	SPDK_DEBUGLOG(fallocate, "allocating space (file=%s,fd=%d): old size %ju, new size %ju\n",
 			fallocate->filename, fallocate->fd, fallocate_size, size);
 
 	rc = posix_fallocate(fallocate->fd, 0, size);
@@ -168,20 +215,19 @@ bdev_fallocate_do_fallocate(struct bdev_fallocate *fallocate, uint64_t size) {
 				fallocate->filename, fallocate->fd, rc, spdk_strerror(rc));
 	}
 
+exit:
 	fallocate->bdev.blockcnt = spdk_fd_get_size(fallocate->fd) / fallocate->bdev.blocklen;
 
-	if (fallocate->access_bdev) {
-		rc = bdev_uring_rescan(fallocate->access_bdev->name);
-	}
+	rc = bdev_uring_rescan(spdk_bdev_desc_get_bdev(fallocate->access_desc)->name);
 
 	return rc;
 }
 
 static int
 bdev_fallocate_do_setxattrs(struct bdev_fallocate *fallocate, const struct bdev_fallocate_xattrs *xattrs) {
-	size_t i;
+	size_t i = 0;
 
-	SPDK_DEBUGLOG("setting xattrs (file=%s,fd=%d)\n", fallocate->filename, fallocate->fd);
+	SPDK_DEBUGLOG(fallocate, "setting xattrs (file=%s,fd=%d)\n", fallocate->filename, fallocate->fd);
 
 	for (i = 0; i < xattrs->num_xattrs; i++) {
 		if (fsetxattr(fallocate->fd, xattrs->xattrs[i].name, xattrs->xattrs[i].value, strlen(xattrs->xattrs[i].value), 0) != 0) {
@@ -194,24 +240,36 @@ bdev_fallocate_do_setxattrs(struct bdev_fallocate *fallocate, const struct bdev_
 }
 
 static void
-dummy_bdev_delete_cb(void *cb_arg, int bdeverrno)
+dummy_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx) {}
+
+static int
+bdev_fallocate_create_cb(void *io_device, void *ctx_buf)
 {
+	struct bdev_fallocate *fallocate = io_device;
+	struct bdev_fallocate_io *fallocate_io = ctx_buf;
+
+	fallocate_io->access_channel = spdk_bdev_get_io_channel(fallocate->access_desc);
+
+	return 0;
 }
 
 static void
-dummy_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx)
+bdev_fallocate_destroy_cb(void *io_device, void *ctx_buf)
 {
+	struct bdev_fallocate_io *fallocate_io = ctx_buf;
+
+	spdk_put_io_channel(fallocate_io->access_channel);
 }
 
 int
 bdev_fallocate_create(const struct bdev_fallocate_create_opts *opts, struct spdk_bdev **bdev)
 {
-	struct bdev_fallocate *fallocate;
+	struct bdev_fallocate *fallocate = NULL;
 	struct bdev_uring_opts uring_opts = {};
-	struct stat statBuf;
+	struct stat statBuf = {};
 	int rc = -1;
 
-	fallocate = calloc(1, sizeof(*fallocate));
+	fallocate = calloc(1, sizeof(struct bdev_fallocate));
 	if (!fallocate) {
 		SPDK_ERRLOG("unable to allocate memory for fallocate backend\n");
 		return rc;
@@ -263,60 +321,95 @@ bdev_fallocate_create(const struct bdev_fallocate_create_opts *opts, struct spdk
 		goto error;
 	}
 
-	rc = bdev_fallocate_do_setxattrs(fallocate, &opts->xattrs);
-	if (rc != 0) {
-		goto error;
-	}
-
-	rc = bdev_fallocate_do_fallocate(fallocate, opts->size);
-	if (rc != 0) {
-		goto error;
-	}
-
 	uring_opts.block_size = fallocate->bdev.blocklen;
 	uring_opts.filename = fallocate->filename;
 	uring_opts.name = spdk_sprintf_alloc("%s-uring", opts->name);
-	fallocate->access_bdev = create_uring_bdev(&uring_opts);
-	if (fallocate->access_bdev == NULL) {
+	if (create_uring_bdev(&uring_opts) == NULL) {
 		SPDK_ERRLOG("create_uring_bdev() failed\n");
 		rc = -1;
 		goto error;
 	}
-	rc = spdk_bdev_module_claim_bdev(fallocate->access_bdev, NULL, &fallocate_if);
+	rc = spdk_bdev_open_ext(uring_opts.name, true, dummy_bdev_event_cb, NULL, &fallocate->access_desc);
 	if (rc != 0) {
-		SPDK_ERRLOG("spdk_bdev_module_claim_bdev() failed, errno %d: %s\n",
-				errno, spdk_strerror(errno));
-		goto error;
+		SPDK_ERRLOG("spdk_bdev_open_ext() failed, rc %d: %s\n",
+				rc, spdk_strerror(rc));
+		goto claim_error;
 	}
+	fallocate->access_thread = spdk_get_thread();
 
-	spdk_io_device_register(fallocate, NULL, NULL, 0, fallocate->bdev.name);
+	spdk_io_device_register(fallocate, bdev_fallocate_create_cb, bdev_fallocate_destroy_cb,
+			sizeof(struct bdev_fallocate_io), fallocate->bdev.name);
 	rc = spdk_bdev_register(&fallocate->bdev);
 	if (rc != 0) {
 		SPDK_ERRLOG("spdk_bdev_register() failed, errno %d: %s\n",
 				errno, spdk_strerror(errno));
-		spdk_bdev_module_release_bdev(fallocate->access_bdev);
-		delete_uring_bdev(uring_opts.name, dummy_bdev_delete_cb, NULL);
-		spdk_io_device_unregister(fallocate, NULL);
-		goto error;
+		goto modify_error;
+	}
+
+	rc = bdev_fallocate_do_setxattrs(fallocate, &opts->xattrs);
+	if (rc != 0) {
+		goto modify_error;
+	}
+
+	rc = bdev_fallocate_do_fallocate(fallocate, opts->size);
+	if (rc != 0) {
+		goto modify_error;
 	}
 
 	TAILQ_INSERT_TAIL(&g_fallocate_bdev_head, fallocate, link);
 	*bdev = &fallocate->bdev;
 	return 0;
 
+modify_error:
+	spdk_bdev_close(fallocate->access_desc);
+	spdk_io_device_unregister(fallocate, bdev_fallocate_io_unregister_cb);
+
+claim_error:
+	delete_uring_bdev(uring_opts.name, dummy_bdev_delete_cb, NULL);
+
 error:
 	bdev_fallocate_close(fallocate);
-	bdev_fallocate_free(fallocate);
+	bdev_fallocate_io_unregister_cb(fallocate);
 	return rc;
+}
+
+struct bdev_fallocate_unregister_ctx {
+	char *filename;
+	spdk_bdev_fallocate_delete_complete cb_fn;
+	void *cb_arg;
+};
+
+static void
+bdev_fallocate_bdev_unregister_cb(void *arg, int bdeverrno)
+{
+	struct bdev_fallocate_unregister_ctx *ctx = arg;
+
+	SPDK_DEBUGLOG(fallocate, "unregister cb, bdeverrno %d\n", bdeverrno);
+
+	if (unlink(ctx->filename) != 0) {
+		SPDK_ERRLOG("unlink() failed (file=%s), errno %d: %s\n",
+				ctx->filename, errno, spdk_strerror(errno));
+	}
+
+	ctx->cb_fn(ctx->cb_arg, bdeverrno);
+	free(ctx->filename);
+	free(ctx);
 }
 
 void
 bdev_fallocate_delete(const struct bdev_fallocate_delete_opts *opts, spdk_bdev_fallocate_delete_complete cb_fn, void *cb_arg)
 {
-	struct spdk_bdev_desc *desc;
-	struct spdk_bdev *bdev;
-	struct bdev_fallocate *fallocate;
-	int rc;
+	struct bdev_fallocate_unregister_ctx *ctx = NULL;
+	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_bdev *bdev = NULL;
+	struct bdev_fallocate *fallocate = NULL;
+	int rc = 0;
+
+	ctx = calloc(1, sizeof(struct bdev_fallocate_unregister_ctx));
+	if (ctx == NULL) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
 
 	rc = spdk_bdev_open_ext(opts->name, false, dummy_bdev_event_cb, NULL, &desc);
 	if (rc != 0) {
@@ -332,15 +425,10 @@ bdev_fallocate_delete(const struct bdev_fallocate_delete_opts *opts, spdk_bdev_f
 
 	fallocate = SPDK_CONTAINEROF(bdev, struct bdev_fallocate, bdev);
 
-	spdk_bdev_module_release_bdev(fallocate->access_bdev);
-	delete_uring_bdev(fallocate->access_bdev->name, dummy_bdev_delete_cb, NULL);
-
-	if (unlink(fallocate->filename) != 0) {
-		SPDK_ERRLOG("unlink() failed (file=%s), errno %d: %s\n",
-				fallocate->filename, errno, spdk_strerror(errno));
-	}
-
-	spdk_bdev_unregister(bdev, cb_fn, cb_arg);
+	ctx->filename = strdup(fallocate->filename);
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	spdk_bdev_unregister(bdev, bdev_fallocate_bdev_unregister_cb, ctx);
 
 cleanup:
 	spdk_bdev_close(desc);
@@ -349,10 +437,10 @@ cleanup:
 int
 bdev_fallocate_resize(const struct bdev_fallocate_resize_opts *opts)
 {
-	struct spdk_bdev_desc *desc;
-	struct spdk_bdev *bdev;
-	struct bdev_fallocate *fallocate;
-	int rc;
+	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_bdev *bdev = NULL;
+	struct bdev_fallocate *fallocate = NULL;
+	int rc = 0;
 
 	rc = spdk_bdev_open_ext(opts->name, false, dummy_bdev_event_cb, NULL, &desc);
 	if (rc != 0) {
@@ -382,10 +470,10 @@ exit:
 
 int
 bdev_fallocate_set_xattrs(const struct bdev_fallocate_set_xattrs_opts *opts) {
-	struct spdk_bdev_desc *desc;
-	struct spdk_bdev *bdev;
-	struct bdev_fallocate *fallocate;
-	int rc;
+	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_bdev *bdev = NULL;
+	struct bdev_fallocate *fallocate = NULL;
+	int rc = 0;
 
 	rc = spdk_bdev_open_ext(opts->name, false, dummy_bdev_event_cb, NULL, &desc);
 	if (rc != 0) {

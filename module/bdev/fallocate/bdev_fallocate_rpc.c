@@ -12,7 +12,7 @@
 
 static void
 free_rpc_bdev_fallocate_xattrs(struct bdev_fallocate_xattrs *xattrs) {
-	size_t i;
+	size_t i = 0;
 
 	for (i = 0; i < xattrs->num_xattrs; i++) {
 		free(xattrs->xattrs[i].name);
@@ -59,8 +59,8 @@ static void
 rpc_bdev_fallocate_create(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
 {
 	struct bdev_fallocate_create_opts opts = {};
-	struct spdk_json_write_ctx *w;
-	struct spdk_bdev *bdev;
+	struct spdk_json_write_ctx *w = NULL;
+	struct spdk_bdev *bdev = NULL;
 	int rc = 0;
 
 	if (spdk_json_decode_object(params, rpc_bdev_fallocate_create_decoders,
