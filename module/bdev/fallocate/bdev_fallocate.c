@@ -321,15 +321,18 @@ bdev_fallocate_create(const struct bdev_fallocate_create_opts *opts, struct spdk
 		goto error;
 	}
 
-	uring_opts.block_size = fallocate->bdev.blocklen;
-	uring_opts.filename = fallocate->filename;
 	uring_opts.name = spdk_sprintf_alloc("%s-uring", opts->name);
-	if (create_uring_bdev(&uring_opts) == NULL) {
-		SPDK_ERRLOG("create_uring_bdev() failed\n");
-		rc = -1;
-		goto error;
-	}
 	rc = spdk_bdev_open_ext(uring_opts.name, true, dummy_bdev_event_cb, NULL, &fallocate->access_desc);
+	if (rc == -ENODEV) {
+		uring_opts.block_size = fallocate->bdev.blocklen;
+		uring_opts.filename = fallocate->filename;
+		if (create_uring_bdev(&uring_opts) == NULL) {
+			SPDK_ERRLOG("create_uring_bdev() failed\n");
+			rc = -1;
+			goto error;
+		}
+		rc = spdk_bdev_open_ext(uring_opts.name, true, dummy_bdev_event_cb, NULL, &fallocate->access_desc);
+	}
 	if (rc != 0) {
 		SPDK_ERRLOG("spdk_bdev_open_ext() failed, rc %d: %s\n",
 				rc, spdk_strerror(rc));
