@@ -4207,7 +4207,7 @@ test_reset_bdev_ctrlr(void)
 	SPDK_CU_ASSERT_FATAL(io_path12 != NULL);
 
 	first_bdev_io = ut_alloc_bdev_io(SPDK_BDEV_IO_TYPE_RESET, nbdev, ch1);
-	first_bio = (struct nvme_bdev_io *)first_bdev_io->driver_ctx;
+	first_bio = (struct nvme_bdev_io *)spdk_bdev_io_to_ctx(first_bdev_io);
 
 	set_thread(1);
 
@@ -4351,7 +4351,7 @@ test_reset_bdev_ctrlr(void)
 	CU_ASSERT(nvme_ctrlr1->resetting == true);
 	CU_ASSERT(nvme_ctrlr1->ctrlr_op_cb_arg == first_bio);
 	CU_ASSERT(TAILQ_FIRST(&nvme_ctrlr1->pending_resets) ==
-		  (struct nvme_bdev_io *)second_bdev_io->driver_ctx);
+		  (struct nvme_bdev_io *)spdk_bdev_io_to_ctx(second_bdev_io));
 
 	poll_threads();
 	spdk_delay_us(g_opts.nvme_adminq_poll_period_us);
@@ -4392,7 +4392,7 @@ test_reset_bdev_ctrlr(void)
 	CU_ASSERT(nvme_ctrlr1->resetting == true);
 	CU_ASSERT(nvme_ctrlr1->ctrlr_op_cb_arg == first_bio);
 	CU_ASSERT(TAILQ_FIRST(&nvme_ctrlr1->pending_resets) ==
-		  (struct nvme_bdev_io *)second_bdev_io->driver_ctx);
+		  (struct nvme_bdev_io *)spdk_bdev_io_to_ctx(second_bdev_io));
 
 	ctrlr2->fail_reset = true;
 
@@ -4444,7 +4444,7 @@ test_reset_bdev_ctrlr(void)
 	CU_ASSERT(nvme_ctrlr1->resetting == true);
 	CU_ASSERT(nvme_ctrlr1->ctrlr_op_cb_arg == first_bio);
 	CU_ASSERT(TAILQ_FIRST(&nvme_ctrlr1->pending_resets) ==
-		  (struct nvme_bdev_io *)second_bdev_io->driver_ctx);
+		  (struct nvme_bdev_io *)spdk_bdev_io_to_ctx(second_bdev_io));
 
 	ctrlr1->fail_reset = true;
 
@@ -4496,7 +4496,7 @@ test_reset_bdev_ctrlr(void)
 	CU_ASSERT(nvme_ctrlr1->resetting == true);
 	CU_ASSERT(nvme_ctrlr1->ctrlr_op_cb_arg == first_bio);
 	CU_ASSERT(TAILQ_FIRST(&nvme_ctrlr1->pending_resets) ==
-		  (struct nvme_bdev_io *)second_bdev_io->driver_ctx);
+		  (struct nvme_bdev_io *)spdk_bdev_io_to_ctx(second_bdev_io));
 
 	ctrlr1->fail_reset = true;
 	ctrlr2->fail_reset = true;
@@ -8120,7 +8120,7 @@ test_race_between_clear_pending_resets_and_reset_ctrlr_complete(void)
 	 */
 	bdev_io = ut_alloc_bdev_io(SPDK_BDEV_IO_TYPE_RESET, nbdev, ch1);
 	bdev_io->internal.status = SPDK_BDEV_IO_STATUS_FAILED;
-	bio = (struct nvme_bdev_io *)bdev_io->driver_ctx;
+	bio = (struct nvme_bdev_io *)spdk_bdev_io_to_ctx(bdev_io);
 
 	/* For simplicity, skip freezing bdev channels. */
 	bdev_nvme_freeze_bdev_channel_done(nbdev, bio, 0);
