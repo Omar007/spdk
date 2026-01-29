@@ -1,6 +1,6 @@
 # Changelog
 
-## v26.01: (Upcoming Release)
+## v26.01
 
 ### accel_ae4dma
 
